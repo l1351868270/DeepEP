@@ -1087,8 +1087,8 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
-Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
                              int num_max_dispatch_tokens_per_rank, int num_experts,
@@ -1140,6 +1140,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn: torch::kBFloat16));
     auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto packed_recv_topk_weights = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
     auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -1167,13 +1168,15 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
         internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
-                               packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
+                               packed_recv_src_info.data_ptr<int>(), 
+                               packed_recv_topk_weights.data_ptr<float>(),
+                               packed_recv_layout_range.data_ptr<int64_t>(),
                                packed_recv_count.data_ptr<int>(),
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
-                               x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+                               x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
                                next_clean_meta.first, next_clean_meta.second,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
                                num_topk, num_experts, rank, num_ranks,
@@ -1199,19 +1202,20 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, recv_hook};
+    return {packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_topk_weights, packed_recv_layout_range, event, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};
 #endif
 }
 
-std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>>
+std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>, std::optional<std::function<void()>>>
 Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                             const torch::Tensor& src_info, const torch::Tensor& layout_range,
                             const std::optional<torch::Tensor>& combine_wait_recv_cost_stats,
                             int num_max_dispatch_tokens_per_rank, int num_experts,
-                            bool use_logfmt, bool zero_copy, bool async, bool return_recv_hook,
+                            bool use_logfmt, bool zero_copy, bool use_fp8, bool round_scale, bool use_ue8m0,
+                            bool async, bool return_recv_hook,
                             const std::optional<torch::Tensor>& out) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
@@ -1259,19 +1263,38 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
 
     // Allocate output tensor
     torch::Tensor combined_x;
+    auto combined_x_scales = std::optional<torch::Tensor>();
+    void* combined_x_scales_ptr = nullptr;
     if (out.has_value()) {
         EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
         EP_HOST_ASSERT(out->size(0) == num_combined_tokens and out->size(1) == hidden);
         EP_HOST_ASSERT(out->scalar_type() == x.scalar_type());
         combined_x = out.value();
     } else {
-        combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+        combined_x = torch::empty({num_combined_tokens, hidden}, 
+            x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn: torch::kBFloat16));
+        // Allocate column-majored scales
+
+        if (use_fp8) {
+            // TODO: support unaligned cases
+            EP_HOST_ASSERT(hidden % 512 == 0);
+            if (not use_ue8m0) {
+                combined_x_scales = torch::empty({num_combined_tokens, hidden / 128},
+                                                torch::dtype(torch::kFloat32).device(torch::kCUDA));
+            } else {
+                EP_HOST_ASSERT(round_scale);
+                combined_x_scales = torch::empty({num_combined_tokens, hidden / 512},
+                                                torch::dtype(torch::kInt).device(torch::kCUDA));
+            }
+            // combined_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
+            combined_x_scales_ptr = combined_x_scales->data_ptr();
+        }
     }
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
     auto launcher = [=](int phases) {
-        internode_ll::combine(combined_x.data_ptr(),
+        internode_ll::combine(combined_x.data_ptr(), combined_x_scales_ptr,
                               buffer.combine_rdma_recv_data_buffer, buffer.combine_rdma_recv_flag_buffer,
                               buffer.combine_rdma_send_buffer,
                               x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
@@ -1281,6 +1304,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
                               num_topk, num_experts, rank, num_ranks,
                               use_logfmt,
+                              use_fp8, round_scale, use_ue8m0,
                               workspace, num_device_sms,
                               launch_stream, phases, zero_copy);
     };
@@ -1302,7 +1326,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
     // Return values
-    return {combined_x, event, recv_hook};
+    return {combined_x, combined_x_scales, event, recv_hook};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
     return {};

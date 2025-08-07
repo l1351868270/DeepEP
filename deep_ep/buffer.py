@@ -512,7 +512,7 @@ class Buffer:
         self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
 
     # noinspection PyTypeChecker
-    def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
+    def low_latency_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
@@ -566,24 +566,25 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
-            self.runtime.low_latency_dispatch(x, topk_idx,
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_topk_weights, packed_recv_layout_range, event, hook = \
+            self.runtime.low_latency_dispatch(x, topk_idx, topk_weights,
                                               cumulative_local_expert_recv_stats,
                                               dispatch_wait_recv_cost_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
                                               async_finish, return_recv_hook)
-        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
-        tensors_to_record = (x, topk_idx,
+        handle = (packed_recv_src_info, packed_recv_topk_weights, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
+        tensors_to_record = (x, topk_idx, topk_weights,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
-                             packed_recv_src_info, packed_recv_layout_range,
+                             packed_recv_src_info, packed_recv_topk_weights, packed_recv_layout_range,
                              cumulative_local_expert_recv_stats)
         return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                            handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
+                            handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, 
+                            use_fp8 = True, round_scale: bool = True, use_ue8m0: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
                             combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
@@ -620,14 +621,15 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
-        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
-        combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
+        src_info, src_topk_weights, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        combined_x, combined_x_scales, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                                    combine_wait_recv_cost_stats,
                                                                    num_max_dispatch_tokens_per_rank, num_experts,
-                                                                   use_logfmt, zero_copy, async_finish, return_recv_hook,
+                                                                   use_logfmt, zero_copy, use_fp8, round_scale, use_ue8m0,
+                                                                   async_finish, return_recv_hook,
                                                                    out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
-        return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
+        return (combined_x, combined_x_scales) if use_fp8 else combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 
     def get_next_low_latency_combine_buffer(self, handle: object):
         """
@@ -641,5 +643,5 @@ class Buffer:
                 `[num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden]`, you should fill this buffer
                 by yourself.
         """
-        src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
+        src_info, src_topk_weights, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)

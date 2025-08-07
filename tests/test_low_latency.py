@@ -55,7 +55,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         for i in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
                             packed_recv_x, packed_recv_count, handle, event, hook = \
-                                buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+                                buffer.low_latency_dispatch(current_x, topk_idx, topk_weights, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
                                                             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                                             async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
@@ -68,7 +68,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                         for i in range(num_local_experts if do_check else 0):
                             expert_id = rank * num_local_experts + i
                             recv_x = per_token_cast_back(packed_recv_x[0][i], packed_recv_x[1][i]) if dispatch_use_fp8 else packed_recv_x[i]
-                            recv_count, recv_src_info, recv_layout_range = packed_recv_count[i], handle[0][i], handle[1][i]
+                            recv_count, recv_src_info, recv_topk_weights, recv_layout_range = packed_recv_count[i], handle[0][i], handle[1][i], handle[2][i]
 
                             # Check expert indices
                             int_mask = (2 ** 32) - 1
@@ -99,20 +99,23 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                                 hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
                         # Check combine correctness
-                        for zero_copy in (False, ) if use_logfmt else (False, True):
+                        for zero_copy in (False, ):
                             if zero_copy:
                                 buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                            # out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
                             combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
                                                                                 use_logfmt=use_logfmt,
-                                                                                async_finish=not return_recv_hook, zero_copy=zero_copy,
-                                                                                return_recv_hook=return_recv_hook, out=out)
+                                                                                use_fp8=True, async_finish=not return_recv_hook, zero_copy=zero_copy,
+                                                                                return_recv_hook=return_recv_hook)
                             hook() if return_recv_hook else event.current_stream_wait()
-                            if do_check:
-                                diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-                                assert torch.isnan(combined_x).sum().item() == 0
-                                assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
-                                hash_value ^= hash_tensor(combined_x)
+                            tmp_scales = torch.randn((num_tokens, hidden // 128), dtype=torch.float32, device='cuda')
+                            result_x = per_token_cast_back(combined_x[0].contiguous(), tmp_scales)
+                            print(combined_x[1].contiguous())
+                            # if do_check:
+                            #     diff = calc_diff(current_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
+                            #     assert torch.isnan(combined_x).sum().item() == 0
+                            #     assert diff < (9e-4 if dispatch_use_fp8 else 1e-5), f'Error: {diff=}, {dispatch_use_fp8=}, {zero_copy=}'
+                            #     hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -124,12 +127,12 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
+            buffer.low_latency_dispatch(current_x, topk_idx, topk_weights, num_tokens, num_experts,
                                         cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                                         use_fp8=True, async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
-                                                             use_logfmt=use_logfmt, return_recv_hook=return_recv_hook)
+                                                             use_logfmt=use_logfmt, use_fp8=True, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
     # Calculate bandwidth

@@ -39,12 +39,14 @@ void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
 __global__ __launch_bounds__(1024, 1) void
 dispatch(void* packed_recv_x, void* packed_recv_x_scales,
-         int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+         int* packed_recv_src_info, 
+         float* packed_recv_topk_weights,
+         int64_t* packed_recv_layout_range,
          int* packed_recv_count,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
-         const void* x, const int64_t* topk_idx,
+         const void* x, const int64_t* topk_idx, const float* topk_weights,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
          int* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
@@ -106,7 +108,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
-
+            auto dst_expert_weight = __ldg(topk_weights + token_idx * num_topk + warp_id);
+            thread_id == 0 ? (*(reinterpret_cast<float*>(rdma_x_src_idx + 1))  = dst_expert_weight) : 0;
             // FP8 cast
             EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
             #pragma unroll
@@ -262,6 +265,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto recv_x_int4 = static_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+        const auto recv_topk_weights = packed_recv_topk_weights + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_scales = align<int>(num_scales, sizeof(float) / sizeof(scale_t));
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
@@ -300,6 +304,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
             if (lane_id == 0)
                 recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
+                recv_topk_weights[recv_token_begin_idx + i] = ld_nc_global(reinterpret_cast<float*>(src_src_idx + 1));
             __syncwarp();
 
             // Copy data
@@ -335,12 +340,14 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
-              int* packed_recv_src_info, int64_t* packed_recv_layout_range,
+              int* packed_recv_src_info, 
+              float* packed_recv_topk_weights,
+              int64_t* packed_recv_layout_range,
               int* packed_recv_count,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
-              const void* x, const int64_t* topk_idx,
+              const void* x, const int64_t* topk_idx, const float* topk_weights,
               int* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
@@ -374,12 +381,14 @@ if (use_fp8 and use_ue8m0) \
     dispatch_func = dispatch<true, true, hidden>; \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
-              packed_recv_src_info, packed_recv_layout_range, \
+              packed_recv_src_info, \
+              packed_recv_topk_weights, \
+              packed_recv_layout_range, \
               packed_recv_count, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
-              x, topk_idx, \
+              x, topk_idx, topk_weights, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
@@ -551,9 +560,9 @@ __forceinline__ __device__ void decode_and_accumulate(uint32_t* ld_buffer, float
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, bool kUseFP8, bool kUseUE8M0, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
 __global__ __launch_bounds__(1024, 1) void
-combine(void* combined_x,
+combine(void* combined_x, void* combined_x_scales,
         void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
         const void* x, const int64_t* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
@@ -576,6 +585,24 @@ combine(void* combined_x,
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
+    // May extract UE8M0 from the scales
+    using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
+    EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
+
+    // FP8 staffs
+    constexpr int kNumPerChannels = 128;
+    const int num_scales = kHidden / kNumPerChannels;
+    const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
+    const size_t hidden_int4 = hidden_bytes / sizeof(int4);
+
+    // // Message package: hidden data, FP8 scales, index at source
+    // // NOTES: currently we have 3 reserved int fields for future use
+    // using vec_t = std::conditional_t<kUseFP8, int2, int4>;
+    // const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    // const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
+    // EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
@@ -917,7 +944,7 @@ combine(void* combined_x,
     }
 }
 
-void combine(void* combined_x,
+void combine(void* combined_x, void* combined_x_scales,
              void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
@@ -926,6 +953,7 @@ void combine(void* combined_x,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              bool use_logfmt,
+             bool use_fp8, bool round_scale, bool use_ue8m0,
              void* workspace, int num_device_sms,
              cudaStream_t stream, int phases, bool zero_copy) {
     constexpr int kNumMaxTopk = 9;
@@ -962,12 +990,20 @@ void combine(void* combined_x,
     const int smem_size = max(smem_send_size, smem_recv_size);
 
 #define COMBINE_LAUNCH_CASE(hidden) { \
-auto combine_func = use_logfmt ? \
-    combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : \
-    combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+auto combine_func = combine<false, false, false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+if (not use_logfmt and use_fp8 and not use_ue8m0) \
+    combine_func = combine<false, true, false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+if (not use_logfmt and use_fp8 and use_ue8m0) \
+    combine_func = combine<false, true, true, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+if (use_logfmt and use_fp8 and not use_ue8m0) \
+    combine_func = combine<true, true, false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+if (use_logfmt and use_fp8 and use_ue8m0) \
+    combine_func = combine<true, true, true, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+if (use_logfmt and not use_fp8) \
+    combine_func = combine<true, false, false,hidden, kNumMaxTopk, kNumMaxUnrolls>; \
 SET_SHARED_MEMORY_FOR_TMA(combine_func); \
 LAUNCH_KERNEL(&cfg, combine_func, \
-              combined_x, \
+              combined_x, combined_x_scales, \
               rdma_recv_x, rdma_recv_flag, rdma_send_x, \
               x, topk_idx, topk_weights, src_info, layout_range, \
               combine_wait_recv_cost_stats, \
